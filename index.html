@@ -9,6 +9,7 @@
 <!-- Firebase SDK -->
 <script src="https://www.gstatic.com/firebasejs/11.10.0/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/11.10.0/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/11.10.0/firebase-firestore-compat.js"></script>
 <!-- PDF.js untuk ekstraksi teks PDF -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <style>
@@ -1330,7 +1331,8 @@ tbody tr:hover { background:var(--table-row-hover); }
       <svg id="iconMoon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
       <svg id="iconSun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
     </button>
-    <span class="footer-text">v1.0 &copy; 2026</span>
+    <span id="syncIndicator" class="dark-toggle" style="cursor:default;padding:0" title="Data tersimpan lokal"></span>
+    <span class="footer-text">v1.1 &copy; 2026</span>
   </div>
 </aside>
 
@@ -1958,6 +1960,234 @@ const firebaseConfig = {
 
 let firebaseAuth = null;
 let currentUser = null;
+let db = null; // Firestore instance
+let firestoreReady = false;
+let isOnline = true;
+let pendingWrites = []; // Antrian tulis saat offline
+
+// ===== FIRESTORE HELPER =====
+function initFirestore() {
+  try {
+    db = firebase.firestore();
+    // Aktifkan offline persistence
+    db.enablePersistence({ synchronizeTabs: true }).catch(function(err) {
+      if (err.code === 'failed-precondition') {
+        console.warn('Firestore persistence gagal: beberapa tab terbuka.');
+      } else if (err.code === 'unimplemented') {
+        console.warn('Browser tidak mendukung Firestore persistence.');
+      }
+    });
+    firestoreReady = true;
+    console.info('Firestore siap.');
+  } catch (e) {
+    console.warn('Firestore init gagal:', e);
+    firestoreReady = false;
+  }
+}
+
+// Dapatkan user data path (per-user)
+function getUserPath() {
+  if (!currentUser) return null;
+  return 'users/' + currentUser.uid;
+}
+
+// Simpan dokumen ke Firestore (per-user)
+function firestoreSave(collection, data) {
+  if (!firestoreReady || !db) return Promise.resolve();
+  var path = getUserPath();
+  if (!path) return Promise.resolve();
+  return db.collection(path).doc(collection).set(data).catch(function(err) {
+    console.warn('Firestore save gagal (' + collection + '):', err.message);
+    // Tambahkan ke antrian jika offline
+    pendingWrites.push({ collection: collection, data: JSON.parse(JSON.stringify(data)) });
+    updateSyncStatus();
+  });
+}
+
+// Muat dokumen dari Firestore (per-user)
+function firestoreLoad(collection) {
+  if (!firestoreReady || !db) return Promise.resolve(null);
+  var path = getUserPath();
+  if (!path) return Promise.resolve(null);
+  return db.collection(path).doc(collection).get().then(function(doc) {
+    if (doc.exists) return doc.data();
+    return null;
+  }).catch(function(err) {
+    console.warn('Firestore load gagal (' + collection + '):', err.message);
+    return null;
+  });
+}
+
+// Hapus dokumen dari Firestore (per-user)
+function firestoreDelete(collection) {
+  if (!firestoreReady || !db) return Promise.resolve();
+  var path = getUserPath();
+  if (!path) return Promise.resolve();
+  return db.collection(path).doc(collection).delete().catch(function(err) {
+    console.warn('Firestore delete gagal:', err.message);
+  });
+}
+
+// Sinkronisasi semua data lokal ke Firestore
+function syncAllToFirestore() {
+  if (!firestoreReady || !currentUser) return;
+  console.info('Sinkronisasi data ke Firestore...');
+  updateSyncStatus('syncing');
+
+  var promises = [];
+  // Sinkronkan surat masuk
+  try {
+    var masukData = JSON.parse(localStorage.getItem('suratMasuk') || '[]');
+    if (masukData.length > 0) promises.push(firestoreSave('suratMasuk', { items: masukData }));
+  } catch(e) {}
+
+  // Sinkronkan surat keluar
+  try {
+    var keluarData = JSON.parse(localStorage.getItem('suratKeluar') || '[]');
+    if (keluarData.length > 0) promises.push(firestoreSave('suratKeluar', { items: keluarData }));
+  } catch(e) {}
+
+  // Sinkronkan counter
+  var counters = {};
+  for (var i = 0; i < localStorage.length; i++) {
+    var key = localStorage.key(i);
+    if (key.indexOf('counter_') === 0) {
+      counters[key] = localStorage.getItem(key);
+    }
+  }
+  if (Object.keys(counters).length > 0) promises.push(firestoreSave('counters', counters));
+
+  // Sinkronkan templates
+  try {
+    var templates = JSON.parse(localStorage.getItem('templates_disdik') || '[]');
+    if (templates.length > 0) promises.push(firestoreSave('templates', { items: templates }));
+  } catch(e) {}
+
+  // Sinkronkan dark mode
+  var darkMode = localStorage.getItem('darkMode');
+  if (darkMode) promises.push(firestoreSave('settings', { darkMode: darkMode }));
+
+  Promise.all(promises).then(function() {
+    console.info('Sinkronisasi Firestore selesai.');
+    updateSyncStatus('synced');
+    // Proses antrian tulis yang tertunda
+    processPendingWrites();
+  }).catch(function(err) {
+    console.warn('Sinkronisasi gagal:', err);
+    updateSyncStatus('error');
+  });
+}
+
+// Muat semua data dari Firestore ke localStorage
+function loadAllFromFirestore() {
+  if (!firestoreReady || !currentUser) return Promise.resolve();
+  console.info('Memuat data dari Firestore...');
+  updateSyncStatus('syncing');
+
+  return Promise.all([
+    firestoreLoad('suratMasuk'),
+    firestoreLoad('suratKeluar'),
+    firestoreLoad('counters'),
+    firestoreLoad('templates'),
+    firestoreLoad('settings')
+  ]).then(function(results) {
+    var masuk = results[0];
+    var keluar = results[1];
+    var counters = results[2];
+    var templates = results[3];
+    var settings = results[4];
+
+    // Muat surat masuk
+    if (masuk && masuk.items && masuk.items.length > 0) {
+      localStorage.setItem('suratMasuk', JSON.stringify(masuk.items));
+      console.info('Surat masuk dimuat: ' + masuk.items.length + ' data');
+    }
+
+    // Muat surat keluar
+    if (keluar && keluar.items && keluar.items.length > 0) {
+      localStorage.setItem('suratKeluar', JSON.stringify(keluar.items));
+      console.info('Surat keluar dimuat: ' + keluar.items.length + ' data');
+    }
+
+    // Muat counter
+    if (counters) {
+      Object.keys(counters).forEach(function(key) {
+        localStorage.setItem(key, counters[key]);
+      });
+      console.info('Counter dimuat: ' + Object.keys(counters).length + ' items');
+    }
+
+    // Muat templates
+    if (templates && templates.items && templates.items.length > 0) {
+      localStorage.setItem('templates_disdik', JSON.stringify(templates.items));
+    }
+
+    // Muat settings
+    if (settings && settings.darkMode) {
+      localStorage.setItem('darkMode', settings.darkMode);
+    }
+
+    updateSyncStatus('synced');
+    console.info('Data dari Firestore berhasil dimuat.');
+  }).catch(function(err) {
+    console.warn('Gagal memuat dari Firestore:', err);
+    updateSyncStatus('error');
+  });
+}
+
+// Proses antrian tulis yang tertunda (saat kembali online)
+function processPendingWrites() {
+  if (pendingWrites.length === 0) return;
+  console.info('Memproses ' + pendingWrites.length + ' tulis tertunda...');
+  var writes = pendingWrites.slice();
+  pendingWrites = [];
+  var promises = writes.map(function(w) {
+    return firestoreSave(w.collection, w.data);
+  });
+  Promise.all(promises).then(function() {
+    console.info('Semua tulis tertunda berhasil diproses.');
+    updateSyncStatus('synced');
+  }).catch(function(err) {
+    console.warn('Gagal memproses tulis tertunda:', err);
+    pendingWrites = pendingWrites.concat(writes);
+    updateSyncStatus('error');
+  });
+}
+
+// Update indikator status sinkronisasi di UI
+function updateSyncStatus(status) {
+  var el = document.getElementById('syncIndicator');
+  if (!el) return;
+  if (status === 'syncing') {
+    el.title = 'Menyinkronkan data...';
+    el.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="var(--warning)" stroke-width="2" width="14" height="14" style="animation:spin 1s linear infinite"><path d="M21 12a9 9 0 1 1-6.219-8.56"/><polyline points="21 3 21 9 15 9"/></svg>';
+  } else if (status === 'synced') {
+    el.title = 'Data tersinkronisasi';
+    el.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="var(--success)" stroke-width="2" width="14" height="14"><path d="M20 6L9 17l-5-5"/></svg>';
+  } else if (status === 'error') {
+    el.title = 'Sinkronisasi gagal (data tersimpan lokal)';
+    el.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="var(--danger)" stroke-width="2" width="14" height="14"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>';
+  } else {
+    el.title = 'Data tersimpan lokal (Firebase tidak aktif)';
+    el.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="var(--text-muted)" stroke-width="2" width="14" height="14"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>';
+  }
+}
+
+// Monitor koneksi online/offline
+function setupConnectivityMonitor() {
+  window.addEventListener('online', function() {
+    isOnline = true;
+    console.info('Kembali online. Memproses tulis tertunda...');
+    if (firestoreReady && currentUser) {
+      processPendingWrites();
+    }
+  });
+  window.addEventListener('offline', function() {
+    isOnline = false;
+    console.info('Offline. Data akan tersimpan lokal dan disinkronkan nanti.');
+    updateSyncStatus('error');
+  });
+}
 
 function initFirebase() {
   // Cek apakah config masih placeholder (belum dikonfigurasi)
@@ -1979,6 +2209,10 @@ function initFirebase() {
   try {
     firebase.initializeApp(firebaseConfig);
     firebaseAuth = firebase.auth();
+    // Inisialisasi Firestore
+    initFirestore();
+    // Monitor konektivitas
+    setupConnectivityMonitor();
     // Monitor auth state
     firebaseAuth.onAuthStateChanged(function(user) {
       if (user) {
@@ -2067,6 +2301,10 @@ function handleEmailSignup(e) {
 }
 
 function handleLogout() {
+  // Sinkronisasi data terakhir ke Firestore sebelum logout
+  if (firestoreReady && currentUser) {
+    syncAllToFirestore();
+  }
   if (firebaseAuth) {
     firebaseAuth.signOut();
   }
@@ -2094,6 +2332,16 @@ function onLoginSuccess(user) {
   document.getElementById('signupBtn').disabled = false;
   // Initialize the main app if not yet
   initApp();
+  // Muat data dari Firestore jika tersedia, lalu render ulang
+  if (firestoreReady) {
+    loadAllFromFirestore().then(function() {
+      // Setelah data dimuat, render ulang semua tabel
+      renderTabelMasuk();
+      renderTabelKeluar();
+      updateDashboard();
+      showToast('Data berhasil dimuat dari cloud.', 'success');
+    });
+  }
 }
 
 function onLogout() {
@@ -2103,6 +2351,7 @@ function onLogout() {
   document.getElementById('loginForm').reset();
   document.getElementById('signupForm').reset();
   hideAuthError();
+  updateSyncStatus();
 }
 
 function switchAuthTab(tab) {
@@ -2340,17 +2589,34 @@ function getSuratMasuk() {
   try { return JSON.parse(localStorage.getItem('suratMasuk') || '[]'); }
   catch(e) { return []; }
 }
-function setSuratMasuk(data) { localStorage.setItem('suratMasuk', JSON.stringify(data)); }
+function setSuratMasuk(data) {
+  localStorage.setItem('suratMasuk', JSON.stringify(data));
+  // Sinkronisasi ke Firestore di background (non-blocking)
+  firestoreSave('suratMasuk', { items: data });
+}
 function getSuratKeluar() {
   try { return JSON.parse(localStorage.getItem('suratKeluar') || '[]'); }
   catch(e) { return []; }
 }
-function setSuratKeluar(data) { localStorage.setItem('suratKeluar', JSON.stringify(data)); }
+function setSuratKeluar(data) {
+  localStorage.setItem('suratKeluar', JSON.stringify(data));
+  // Sinkronisasi ke Firestore di background (non-blocking)
+  firestoreSave('suratKeluar', { items: data });
+}
 function getCounter(kode, tahun) {
   return parseInt(localStorage.getItem('counter_' + kode + '_' + tahun) || '0');
 }
 function setCounter(kode, tahun, val) {
   localStorage.setItem('counter_' + kode + '_' + tahun, val.toString());
+  // Sinkronisasi counter ke Firestore di background
+  var counters = {};
+  for (var i = 0; i < localStorage.length; i++) {
+    var key = localStorage.key(i);
+    if (key.indexOf('counter_') === 0) {
+      counters[key] = localStorage.getItem(key);
+    }
+  }
+  firestoreSave('counters', counters);
 }
 
 // ===== UTILITY =====
@@ -2451,6 +2717,8 @@ document.getElementById('darkToggle').addEventListener('click', () => {
     document.getElementById('iconSun').style.display = 'block';
     showToast('Mode gelap diaktifkan', 'info');
   }
+  // Sinkronisasi setting ke Firestore
+  firestoreSave('settings', { darkMode: localStorage.getItem('darkMode') });
 });
 
 // ===== KODE KLASIFIKASI COMBOBOX =====
@@ -4466,6 +4734,8 @@ function getTemplates() {
 }
 function setTemplates(data) {
   localStorage.setItem('templates_disdik', JSON.stringify(data));
+  // Sinkronisasi ke Firestore di background
+  firestoreSave('templates', { items: data });
 }
 
 // ===== DEFAULT TEMPLATES =====
