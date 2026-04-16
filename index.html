@@ -2209,39 +2209,54 @@ function getUserPath() {
 // Simpan dokumen ke Firestore (per-user)
 // Path: users/{uid}/suratMasuk/data (4 segment = document path)
 function firestoreSave(collection, data) {
-  if (!firestoreReady || !db) return Promise.resolve();
-  var uid = currentUser.uid;
-  var docPath = 'users/' + uid + '/' + collection + '/data';
-  return db.doc(docPath).set(data).catch(function(err) {
-    console.warn('Firestore save gagal (' + collection + '):', err.message);
-    // Tambahkan ke antrian jika offline
-    pendingWrites.push({ collection: collection, data: JSON.parse(JSON.stringify(data)) });
-    updateSyncStatus();
-  });
+  if (!firestoreReady || !db || !currentUser) return Promise.resolve();
+  try {
+    var uid = currentUser.uid;
+    var docPath = 'users/' + uid + '/' + collection + '/data';
+    return db.doc(docPath).set(data).catch(function(err) {
+      console.warn('Firestore save gagal (' + collection + '):', err.message);
+      // Tambahkan ke antrian jika offline
+      pendingWrites.push({ collection: collection, data: JSON.parse(JSON.stringify(data)) });
+      updateSyncStatus();
+    });
+  } catch(e) {
+    console.warn('Firestore save error:', e.message);
+    return Promise.resolve();
+  }
 }
 
 // Muat dokumen dari Firestore (per-user)
 function firestoreLoad(collection) {
-  if (!firestoreReady || !db) return Promise.resolve(null);
-  var uid = currentUser.uid;
-  var docPath = 'users/' + uid + '/' + collection + '/data';
-  return db.doc(docPath).get().then(function(doc) {
-    if (doc.exists) return doc.data();
-    return null;
-  }).catch(function(err) {
-    console.warn('Firestore load gagal (' + collection + '):', err.message);
-    return null;
-  });
+  if (!firestoreReady || !db || !currentUser) return Promise.resolve(null);
+  try {
+    var uid = currentUser.uid;
+    var docPath = 'users/' + uid + '/' + collection + '/data';
+    return db.doc(docPath).get().then(function(doc) {
+      if (doc.exists) return doc.data();
+      return null;
+    }).catch(function(err) {
+      console.warn('Firestore load gagal (' + collection + '):', err.message);
+      return null;
+    });
+  } catch(e) {
+    console.warn('Firestore load error:', e.message);
+    return Promise.resolve(null);
+  }
 }
 
 // Hapus dokumen dari Firestore (per-user)
 function firestoreDelete(collection) {
-  if (!firestoreReady || !db) return Promise.resolve();
-  var uid = currentUser.uid;
-  var docPath = 'users/' + uid + '/' + collection + '/data';
-  return db.doc(docPath).delete().catch(function(err) {
-    console.warn('Firestore delete gagal:', err.message);
-  });
+  if (!firestoreReady || !db || !currentUser) return Promise.resolve();
+  try {
+    var uid = currentUser.uid;
+    var docPath = 'users/' + uid + '/' + collection + '/data';
+    return db.doc(docPath).delete().catch(function(err) {
+      console.warn('Firestore delete gagal:', err.message);
+    });
+  } catch(e) {
+    console.warn('Firestore delete error:', e.message);
+    return Promise.resolve();
+  }
 }
 
 // Sinkronisasi semua data lokal ke Firestore
@@ -2877,8 +2892,8 @@ function getSuratMasuk() {
 }
 function setSuratMasuk(data) {
   localStorage.setItem('suratMasuk', JSON.stringify(data));
-  // Sinkronisasi ke Firestore di background (non-blocking)
-  firestoreSave('suratMasuk', { items: data });
+  // Sinkronisasi ke Firestore di background (non-blocking, tidak boleh crash UI)
+  try { firestoreSave('suratMasuk', { items: data }); } catch(e) { console.warn('setSuratMasuk sync error:', e); }
 }
 function getSuratKeluar() {
   try { return JSON.parse(localStorage.getItem('suratKeluar') || '[]'); }
@@ -2886,8 +2901,8 @@ function getSuratKeluar() {
 }
 function setSuratKeluar(data) {
   localStorage.setItem('suratKeluar', JSON.stringify(data));
-  // Sinkronisasi ke Firestore di background (non-blocking)
-  firestoreSave('suratKeluar', { items: data });
+  // Sinkronisasi ke Firestore di background (non-blocking, tidak boleh crash UI)
+  try { firestoreSave('suratKeluar', { items: data }); } catch(e) { console.warn('setSuratKeluar sync error:', e); }
 }
 function getCounter(kode, tahun) {
   return parseInt(localStorage.getItem('counter_' + kode + '_' + tahun) || '0');
